@@ -2,7 +2,8 @@
 # MAGIC %md
 # MAGIC # Silver — Empresas (com Simples/MEI)
 # MAGIC
-# MAGIC **Origem:** `workspace.bronze.empresas` + `workspace.bronze.naturezas_juridicas` + `workspace.bronze.simples`
+# MAGIC **Origem:** `workspace.bronze.empresas` + `workspace.bronze.simples` (só o mês de `dt_referencia`) + `silver.dim_natureza_juridica`
+# MAGIC **Depende de:** `silver_dominios`
 # MAGIC **Destino:** `workspace.silver.cnpj_empresas`
 # MAGIC **Grão:** uma empresa por linha (`cnpj_basico`).
 # MAGIC
@@ -32,7 +33,7 @@ print(f"dt_referencia: {DT_REFERENCIA}")
 
 # COMMAND ----------
 
-df_bronze = spark.table("workspace.bronze.empresas")
+df_bronze = ler_bronze("empresas", DT_REFERENCIA)
 
 
 def para_data(coluna):
@@ -42,7 +43,7 @@ def para_data(coluna):
 
 # capital_social: remove ponto de milhar (se houver), troca vírgula decimal por ponto, try_cast evita quebra
 df_empresas = df_bronze.select(
-    F.trim("cnpj_basico").alias("cnpj_basico"),
+    F.upper(F.trim("cnpj_basico")).alias("cnpj_basico"),
     F.lpad(F.trim("cod_natureza_juridica"), 4, "0").alias("cod_natureza_juridica"),
     F.lpad(F.trim("cod_qualificacao_responsavel"), 2, "0").alias("cod_qualificacao_responsavel"),
     F.expr("try_cast(nullif(regexp_replace(regexp_replace(trim(capital_social), '\\\\.', ''), ',', '.'), '') AS DECIMAL(20,2))")
@@ -52,19 +53,14 @@ df_empresas = df_bronze.select(
     F.trim("capital_social").alias("_capital_original"),
 )
 
-df_natureza = (
-    spark.table("workspace.bronze.naturezas_juridicas")
-    .select(
-        F.lpad(F.trim("cod_natureza_juridica"), 4, "0").alias("cod_natureza_juridica"),
-        F.trim("descricao_natureza_juridica").alias("desc_natureza_juridica"),
-    )
-    .dropDuplicates(["cod_natureza_juridica"])
+df_natureza = spark.table("workspace.silver.dim_natureza_juridica").select(
+    "cod_natureza_juridica", "desc_natureza_juridica", "grupo_natureza_juridica"
 )
 
 df_simples = (
-    spark.table("workspace.bronze.simples")
+    ler_bronze("simples", DT_REFERENCIA)
     .select(
-        F.trim("cnpj_basico").alias("cnpj_basico"),
+        F.upper(F.trim("cnpj_basico")).alias("cnpj_basico"),
         (F.upper(F.trim("opcao_simples")) == "S").alias("flag_simples"),
         para_data("data_opcao_simples").alias("dt_opcao_simples"),
         para_data("data_exclusao_simples").alias("dt_exclusao_simples"),
@@ -82,15 +78,7 @@ df_simples = (
 # COMMAND ----------
 
 portes = {"00": "Não informado", "01": "Micro empresa", "03": "Empresa de pequeno porte", "05": "Demais"}
-grupos_natureza = {
-    "1": "Administração Pública",
-    "2": "Entidade Empresarial",
-    "3": "Entidade sem Fins Lucrativos",
-    "4": "Pessoa Física",
-    "5": "Organização Internacional",
-}
 mapa_porte = F.create_map(*[F.lit(x) for par in portes.items() for x in par])
-mapa_grupo = F.create_map(*[F.lit(x) for par in grupos_natureza.items() for x in par])
 
 df_silver = (
     df_empresas
@@ -98,10 +86,7 @@ df_silver = (
     .join(df_simples, on="cnpj_basico", how="left")
     .withColumn("dt_referencia", F.lit(DT_REFERENCIA).cast("date"))
     .withColumn("desc_porte", F.coalesce(mapa_porte[F.col("cod_porte")], F.lit("Não mapeado")))
-    .withColumn(
-        "grupo_natureza_juridica",
-        F.coalesce(mapa_grupo[F.substring("cod_natureza_juridica", 1, 1)], F.lit("Não mapeado")),
-    )
+    .withColumn("grupo_natureza_juridica", F.coalesce("grupo_natureza_juridica", F.lit("Não mapeado")))
     .withColumn("flag_simples", F.coalesce("flag_simples", F.lit(False)))
     .withColumn("flag_mei", F.coalesce("flag_mei", F.lit(False)))
 )
@@ -126,31 +111,32 @@ display(df_silver.select(*colunas_finais).limit(10))
 
 # COMMAND ----------
 
-total_bronze = df_bronze.count()
-total_silver = df_silver.count()
+with Cronometro("silver_empresas", "checks", DT_REFERENCIA):
+    total_bronze = df_bronze.count()
+    total_silver = df_silver.count()
 
-executar_checks(
-    df_silver, TABELA_DESTINO, DT_REFERENCIA,
-    regras=[
-        regra("cnpj_basico com 8 dígitos numéricos", "bloqueia",
-              ~F.coalesce(F.col("cnpj_basico"), F.lit("")).rlike(r"^\d{8}$")),
-        regra("porte no domínio (00,01,03,05)", "alerta",
-              ~F.col("cod_porte").isin(*portes.keys()), limite_pct=0.1),
-        regra("capital social preenchido mas não convertido", "alerta",
-              (F.coalesce(F.col("_capital_original"), F.lit("")) != "") & F.col("capital_social").isNull(),
-              limite_pct=0.1),
-        regra("capital social negativo", "alerta", F.col("capital_social") < 0),
-        regra("natureza jurídica fora do domínio", "alerta",
-              F.col("desc_natureza_juridica").isNull(), limite_pct=0.1),
-        regra("MEI que não é optante do Simples", "alerta",
-              F.col("flag_mei") & ~F.col("flag_simples"), limite_pct=1.0),
-    ],
-    resultados_extras=[
-        resultado("tabela não vazia", "bloqueia", 0 if total_silver > 0 else 1, 1),
-        check_contagem(total_bronze, total_silver, "mesma contagem bronze x silver"),
-        check_unicidade(df_silver, ["cnpj_basico"]),
-    ],
-)
+    executar_checks(
+        df_silver, TABELA_DESTINO, DT_REFERENCIA,
+        regras=[
+            regra("cnpj_basico com 8 caracteres alfanuméricos (CNPJ alfanumérico desde 07/2026)", "bloqueia",
+                  ~F.coalesce(F.col("cnpj_basico"), F.lit("")).rlike(r"^[A-Z0-9]{8}$")),
+            regra("porte no domínio (00,01,03,05)", "alerta",
+                  ~F.col("cod_porte").isin(*portes.keys()), limite_pct=0.1),
+            regra("capital social preenchido mas não convertido", "alerta",
+                  (F.coalesce(F.col("_capital_original"), F.lit("")) != "") & F.col("capital_social").isNull(),
+                  limite_pct=0.1),
+            regra("capital social negativo", "alerta", F.col("capital_social") < 0),
+            regra("natureza jurídica fora do domínio", "alerta",
+                  F.col("desc_natureza_juridica").isNull(), limite_pct=0.1),
+            regra("MEI que não é optante do Simples", "alerta",
+                  F.col("flag_mei") & ~F.col("flag_simples"), limite_pct=1.0),
+        ],
+        resultados_extras=[
+            resultado("tabela não vazia", "bloqueia", 0 if total_silver > 0 else 1, 1),
+            check_contagem(total_bronze, total_silver, "mesma contagem bronze x silver"),
+            check_unicidade(df_silver, ["cnpj_basico"]),
+        ],
+    )
 
 # COMMAND ----------
 
@@ -159,7 +145,8 @@ executar_checks(
 
 # COMMAND ----------
 
-gravar_particao(df_silver.select(*colunas_finais), TABELA_DESTINO, DT_REFERENCIA)
+with Cronometro("silver_empresas", "gravacao", DT_REFERENCIA):
+    gravar_particao(df_silver.select(*colunas_finais), TABELA_DESTINO, DT_REFERENCIA)
 
 # COMMAND ----------
 

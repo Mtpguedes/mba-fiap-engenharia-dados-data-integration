@@ -6,8 +6,9 @@
 # MAGIC %md
 # MAGIC # Silver — Estabelecimentos
 # MAGIC
-# MAGIC **Origem:** `workspace.bronze.estabelecimentos` + `workspace.bronze.cnaes`
-# MAGIC **Destino:** `workspace.silver.cnpj_estabelecimentos` e `workspace.silver.dim_cnae`
+# MAGIC **Origem:** `workspace.bronze.estabelecimentos` (só o mês de `dt_referencia`) + `silver.dim_cnae` + `silver.dim_municipio`
+# MAGIC **Destino:** `workspace.silver.cnpj_estabelecimentos`
+# MAGIC **Depende de:** `silver_dominios`
 # MAGIC **Grão:** um estabelecimento por linha (`cnpj_basico + cnpj_ordem + cnpj_dv`), Brasil inteiro.
 # MAGIC **Consumidores:** Demografia (Matheus), Geografia (Rafael), Mortalidade (Helen).
 # MAGIC
@@ -16,7 +17,8 @@
 # MAGIC | Códigos padronizados | `situacao_cadastral` e motivo com 2 dígitos, CNAE com 7 dígitos (`lpad`) |
 # MAGIC | Datas | `yyyyMMdd` → `date` com `try_to_timestamp + cast`; `0`, vazio, inválido ou anterior a 1900 viram nulo e ganham flag |
 # MAGIC | `idade_meses` | Baixada (08): data da baixa − início (nula se a data da baixa faltar ou vier antes do início). Demais: `dt_referencia` − início |
-# MAGIC | `flag_ti` | CNAE principal começando com `62` ou `631` (mesma regra da gold de risco societário) |
+# MAGIC | `flag_ti` | Vem da `silver.dim_cnae` (CNAE principal começando com `62` ou `631`) |
+# MAGIC | Localização | `cod_municipio` com 4 dígitos + `desc_municipio` (da `dim_municipio`) + `regiao` derivada da UF |
 # MAGIC | LGPD | Saem logradouro, número, complemento, CEP completo, telefones, fax, e-mail e nome fantasia. Ficam `cep_5` e `bairro` |
 
 # COMMAND ----------
@@ -28,50 +30,9 @@
 DT_REFERENCIA = obter_dt_referencia()
 TABELA_DESTINO = "workspace.silver.cnpj_estabelecimentos"
 TABELA_DIM_CNAE = "workspace.silver.dim_cnae"
+TABELA_DIM_MUNICIPIO = "workspace.silver.dim_municipio"
 
 print(f"dt_referencia: {DT_REFERENCIA}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 1. Domínio de CNAE com a flag de TI
-# MAGIC
-# MAGIC A regra de TI fica numa tabela só. Qualquer frente que precise saber se um CNAE é de TI faz join aqui, em vez de repetir a lista no código.
-
-# COMMAND ----------
-
-df_dim_cnae = (
-    spark.table("workspace.bronze.cnaes")
-    .select(
-        F.lpad(F.trim("cod_cnae"), 7, "0").alias("cod_cnae"),
-        F.trim("descricao_cnae").alias("desc_cnae"),
-    )
-    .dropDuplicates(["cod_cnae"])
-    .withColumn("cod_divisao", F.substring("cod_cnae", 1, 2))
-    .withColumn(
-        "flag_ti",
-        F.col("cod_cnae").startswith("62") | F.col("cod_cnae").startswith("631"),
-    )
-)
-
-display(df_dim_cnae.filter("flag_ti").orderBy("cod_cnae"))
-
-# COMMAND ----------
-
-executar_checks(
-    df_dim_cnae, TABELA_DIM_CNAE, DT_REFERENCIA,
-    regras=[
-        regra("cod_cnae com 7 dígitos numéricos", "bloqueia", ~F.col("cod_cnae").rlike(r"^\d{7}$")),
-        regra("descrição preenchida", "alerta", F.coalesce(F.col("desc_cnae"), F.lit("")) == ""),
-    ],
-    resultados_extras=[
-        resultado("existe ao menos um CNAE de TI", "bloqueia",
-                  0 if df_dim_cnae.filter("flag_ti").count() > 0 else 1, 1),
-    ],
-)
-
-# Domínio pequeno e sem histórico: sobrescreve inteiro
-df_dim_cnae.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(TABELA_DIM_CNAE)
 
 # COMMAND ----------
 
@@ -80,7 +41,7 @@ df_dim_cnae.write.format("delta").mode("overwrite").option("overwriteSchema", "t
 
 # COMMAND ----------
 
-df_bronze = spark.table("workspace.bronze.estabelecimentos")
+df_bronze = ler_bronze("estabelecimentos", DT_REFERENCIA)
 
 
 def para_data(coluna):
@@ -92,8 +53,8 @@ def para_data(coluna):
 df_limpo = (
     df_bronze
     .select(
-        F.trim("cnpj_basico").alias("cnpj_basico"),
-        F.trim("cnpj_ordem").alias("cnpj_ordem"),
+        F.upper(F.trim("cnpj_basico")).alias("cnpj_basico"),
+        F.upper(F.trim("cnpj_ordem")).alias("cnpj_ordem"),
         F.trim("cnpj_dv").alias("cnpj_dv"),
         F.trim("identificador_matriz_filial").alias("identificador_matriz_filial"),
         F.lpad(F.trim("situacao_cadastral"), 2, "0").alias("cod_situacao"),
@@ -105,10 +66,10 @@ df_limpo = (
         F.lpad(F.trim("cnae_fiscal_principal"), 7, "0").alias("cnae_principal"),
         F.nullif(F.trim("cnae_fiscal_secundaria"), F.lit("")).alias("cnae_secundaria"),
         F.upper(F.trim("uf")).alias("uf"),
-        F.trim("cod_municipio").alias("cod_municipio"),
+        F.lpad(F.trim("cod_municipio"), 4, "0").alias("cod_municipio"),
         F.trim("bairro").alias("bairro"),
         F.substring(F.regexp_replace("cep", r"\D", ""), 1, 5).alias("cep_5"),
-        F.trim("cod_pais").alias("cod_pais"),
+        F.when(F.trim("cod_pais") != "", F.lpad(F.trim("cod_pais"), 3, "0")).alias("cod_pais"),
         F.trim("nome_cidade_exterior").alias("nome_cidade_exterior"),
         # Guardamos o texto original só para os checks de conversão de data
         F.trim("data_inicio_atividade").alias("_dt_inicio_original"),
@@ -124,6 +85,15 @@ df_limpo = (
 
 situacoes = {"01": "Nula", "02": "Ativa", "03": "Suspensa", "04": "Inapta", "08": "Baixada"}
 mapa_situacao = F.create_map(*[F.lit(x) for par in situacoes.items() for x in par])
+
+regioes = {
+    "Norte": ["AC", "AM", "AP", "PA", "RO", "RR", "TO"],
+    "Nordeste": ["AL", "BA", "CE", "MA", "PB", "PE", "PI", "RN", "SE"],
+    "Centro-Oeste": ["DF", "GO", "MS", "MT"],
+    "Sudeste": ["ES", "MG", "RJ", "SP"],
+    "Sul": ["PR", "RS", "SC"],
+}
+mapa_regiao = F.create_map(*[F.lit(x) for regiao, ufs in regioes.items() for uf in ufs for x in (uf, regiao)])
 
 dt_ref = F.lit(DT_REFERENCIA).cast("date")
 eh_baixada = F.col("cod_situacao") == "08"
@@ -171,6 +141,12 @@ df_silver = (
         how="left",
     )
     .withColumn("flag_ti", F.coalesce("flag_ti", F.lit(False)))
+    .join(
+        F.broadcast(spark.table(TABELA_DIM_MUNICIPIO).select("cod_municipio", "desc_municipio")),
+        on="cod_municipio",
+        how="left",
+    )
+    .withColumn("regiao", F.coalesce(mapa_regiao[F.col("uf")], F.lit("Exterior/Não informada")))
 )
 
 colunas_finais = [
@@ -180,7 +156,7 @@ colunas_finais = [
     "dt_inicio_atividade", "ano_abertura", "idade_meses",
     "flag_dt_inicio_invalida", "flag_dt_inicio_futura",
     "cnae_principal", "desc_cnae_principal", "flag_ti", "cnae_secundaria", "qtd_cnaes_secundarios",
-    "uf", "cod_municipio", "bairro", "cep_5", "cod_pais", "nome_cidade_exterior",
+    "regiao", "uf", "cod_municipio", "desc_municipio", "bairro", "cep_5", "cod_pais", "nome_cidade_exterior",
 ]
 
 display(df_silver.select(*colunas_finais).limit(10))
@@ -200,8 +176,9 @@ def regras_estabelecimentos(dt_referencia):
     return [
         regra("chave cnpj não nula", "bloqueia",
               F.col("cnpj_basico").isNull() | F.col("cnpj_ordem").isNull() | F.col("cnpj_dv").isNull()),
-        regra("cnpj_completo com 14 dígitos numéricos", "bloqueia",
-              ~F.coalesce(F.col("cnpj_completo"), F.lit("")).rlike(r"^\d{14}$")),
+        # Desde 31/07/2026 a Receita emite CNPJ alfanumérico: 12 posições A-Z/0-9 + 2 dígitos verificadores
+        regra("cnpj_completo no formato (12 alfanuméricos + 2 dígitos)", "bloqueia",
+              ~F.coalesce(F.col("cnpj_completo"), F.lit("")).rlike(r"^[A-Z0-9]{12}[0-9]{2}$")),
         regra("situação cadastral no domínio (01,02,03,04,08)", "bloqueia",
               ~F.col("cod_situacao").isin(*situacoes.keys()) | F.col("cod_situacao").isNull()),
         regra("matriz/filial no domínio (1,2)", "bloqueia",
@@ -216,6 +193,8 @@ def regras_estabelecimentos(dt_referencia):
               F.col("desc_cnae_principal").isNull(), limite_pct=0.1),
         regra("UF vazia", "alerta",
               F.coalesce(F.col("uf"), F.lit("")) == "", limite_pct=0.1),
+        regra("município fora do domínio", "alerta",
+              F.col("desc_municipio").isNull() & (F.coalesce(F.col("uf"), F.lit("EX")) != "EX"), limite_pct=0.1),
     ]
 
 # COMMAND ----------
@@ -230,25 +209,28 @@ def regras_estabelecimentos(dt_referencia):
 amostra = df_silver.limit(5).collect()
 colunas = df_silver.columns
 
-linha_invalida = amostra[1].asDict()
-linha_invalida["cod_situacao"] = "99"
+if len(amostra) < 2:
+    print("Demonstração pulada: não há linhas suficientes neste mês.")
+else:
+    linha_invalida = amostra[1].asDict()
+    linha_invalida["cod_situacao"] = "99"
 
-df_teste = spark.createDataFrame(
-    [tuple(r) for r in amostra]
-    + [tuple(amostra[0])]                               # duplicada
-    + [tuple(linha_invalida[c] for c in colunas)],      # situação inválida
-    schema=df_silver.schema,
-)
-
-try:
-    executar_checks(
-        df_teste, "DEMONSTRACAO_FALHA", DT_REFERENCIA,
-        regras=regras_estabelecimentos(DT_REFERENCIA),
-        resultados_extras=[check_unicidade(df_teste, ["cnpj_basico", "cnpj_ordem", "cnpj_dv"])],
-        gravar_log=False,
+    df_teste = spark.createDataFrame(
+        [tuple(r) for r in amostra]
+        + [tuple(amostra[0])]                               # duplicada
+        + [tuple(linha_invalida[c] for c in colunas)],      # situação inválida
+        schema=df_silver.schema,
     )
-except ValueError as erro:
-    print(f"Comportamento esperado — a gravação foi bloqueada:\n{erro}")
+
+    try:
+        executar_checks(
+            df_teste, "DEMONSTRACAO_FALHA", DT_REFERENCIA,
+            regras=regras_estabelecimentos(DT_REFERENCIA),
+            resultados_extras=[check_unicidade(df_teste, ["cnpj_basico", "cnpj_ordem", "cnpj_dv"])],
+            gravar_log=False,
+        )
+    except ValueError as erro:
+        print(f"Comportamento esperado — a gravação foi bloqueada:\n{erro}")
 
 # COMMAND ----------
 
@@ -257,23 +239,25 @@ except ValueError as erro:
 
 # COMMAND ----------
 
-total_bronze = df_bronze.count()
-total_silver = df_silver.count()
+with Cronometro("silver_estabelecimentos", "checks", DT_REFERENCIA):
+    total_bronze = df_bronze.count()
+    total_silver = df_silver.count()
 
-executar_checks(
-    df_silver, TABELA_DESTINO, DT_REFERENCIA,
-    regras=regras_estabelecimentos(DT_REFERENCIA),
-    resultados_extras=[
-        resultado("tabela não vazia", "bloqueia", 0 if total_silver > 0 else 1, 1),
-        check_contagem(total_bronze, total_silver, "mesma contagem bronze x silver"),
-        check_unicidade(df_silver, ["cnpj_basico", "cnpj_ordem", "cnpj_dv"]),
-        check_integridade(
-            df_silver, spark.table("workspace.bronze.empresas").select(F.trim("cnpj_basico").alias("cnpj_basico")),
-            ["cnpj_basico"], "estabelecimento sem empresa correspondente",
-            total=total_silver, limite_pct=0.1,
-        ),
-    ],
-)
+    executar_checks(
+        df_silver, TABELA_DESTINO, DT_REFERENCIA,
+        regras=regras_estabelecimentos(DT_REFERENCIA),
+        resultados_extras=[
+            resultado("tabela não vazia", "bloqueia", 0 if total_silver > 0 else 1, 1),
+            check_contagem(total_bronze, total_silver, "mesma contagem bronze x silver"),
+            check_unicidade(df_silver, ["cnpj_basico", "cnpj_ordem", "cnpj_dv"]),
+            check_integridade(
+                df_silver,
+                ler_bronze("empresas", DT_REFERENCIA).select(F.upper(F.trim("cnpj_basico")).alias("cnpj_basico")),
+                ["cnpj_basico"], "estabelecimento sem empresa correspondente",
+                total=total_silver, limite_pct=0.1,
+            ),
+        ],
+    )
 
 # COMMAND ----------
 
@@ -282,7 +266,8 @@ executar_checks(
 
 # COMMAND ----------
 
-gravar_particao(df_silver.select(*colunas_finais), TABELA_DESTINO, DT_REFERENCIA)
+with Cronometro("silver_estabelecimentos", "gravacao", DT_REFERENCIA):
+    gravar_particao(df_silver.select(*colunas_finais), TABELA_DESTINO, DT_REFERENCIA)
 
 # COMMAND ----------
 

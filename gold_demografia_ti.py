@@ -88,27 +88,28 @@ display(df_gold.orderBy(F.desc("qtd_empresas_abertas")).limit(20))
 
 # COMMAND ----------
 
-total_universo = df_matrizes_ti.count()
-soma_gold = df_gold.agg(F.sum("qtd_empresas_abertas")).first()[0] or 0
+with Cronometro("gold_demografia_ti", "checks", DT_REFERENCIA):
+    total_universo = df_matrizes_ti.count()
+    soma_gold = df_gold.agg(F.sum("qtd_empresas_abertas")).first()[0] or 0
 
-executar_checks(
-    df_gold, TABELA_DESTINO, DT_REFERENCIA,
-    regras=[
-        regra("ativas ≤ abertas", "bloqueia", F.col("qtd_ativas") > F.col("qtd_empresas_abertas")),
-        regra("ativas + suspensas/inaptas + baixadas ≤ abertas", "bloqueia",
-              F.col("qtd_ativas") + F.col("qtd_suspensas_inaptas") + F.col("qtd_baixadas") > F.col("qtd_empresas_abertas")),
-        regra("idade mediana negativa", "bloqueia", F.col("idade_mediana_meses_ativas") < 0),
-        regra("grupo sem ano de abertura válido", "alerta", F.col("ano_abertura").isNull(), limite_pct=1.0),
-        regra("grupo sem cadastro de empresa", "alerta",
-              F.col("desc_porte") == "Sem cadastro de empresa", limite_pct=1.0),
-    ],
-    resultados_extras=[
-        resultado("universo de TI não vazio", "bloqueia", 0 if total_universo > 0 else 1, 1),
-        check_contagem(total_universo, soma_gold, "reconciliação: soma da gold = matrizes de TI na silver"),
-        check_unicidade(df_matrizes_ti, ["cnpj_basico"]),
-        check_unicidade(df_gold, dimensoes),
-    ],
-)
+    executar_checks(
+        df_gold, TABELA_DESTINO, DT_REFERENCIA,
+        regras=[
+            regra("ativas ≤ abertas", "bloqueia", F.col("qtd_ativas") > F.col("qtd_empresas_abertas")),
+            regra("ativas + suspensas/inaptas + baixadas ≤ abertas", "bloqueia",
+                  F.col("qtd_ativas") + F.col("qtd_suspensas_inaptas") + F.col("qtd_baixadas") > F.col("qtd_empresas_abertas")),
+            regra("idade mediana negativa", "bloqueia", F.col("idade_mediana_meses_ativas") < 0),
+            regra("grupo sem ano de abertura válido", "alerta", F.col("ano_abertura").isNull(), limite_pct=1.0),
+            regra("grupo sem cadastro de empresa", "alerta",
+                  F.col("desc_porte") == "Sem cadastro de empresa", limite_pct=1.0),
+        ],
+        resultados_extras=[
+            resultado("universo de TI não vazio", "bloqueia", 0 if total_universo > 0 else 1, 1),
+            check_contagem(total_universo, soma_gold, "reconciliação: soma da gold = matrizes de TI na silver"),
+            check_unicidade(df_matrizes_ti, ["cnpj_basico"]),
+            check_unicidade(df_gold, dimensoes),
+        ],
+    )
 
 # COMMAND ----------
 
@@ -117,7 +118,8 @@ executar_checks(
 
 # COMMAND ----------
 
-gravar_particao(df_gold, TABELA_DESTINO, DT_REFERENCIA)
+with Cronometro("gold_demografia_ti", "gravacao", DT_REFERENCIA):
+    gravar_particao(df_gold, TABELA_DESTINO, DT_REFERENCIA)
 
 # COMMAND ----------
 
