@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "6"
+# ///
 # MAGIC %md
 # MAGIC # Gold — Demografia de Empresas de TI e Tempo de Vida do Setor
 # MAGIC

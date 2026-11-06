@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "6"
+# ///
 # MAGIC %md
 # MAGIC # Silver — Empresas (com Simples/MEI)
 # MAGIC
@@ -14,6 +18,7 @@
 # MAGIC | Grupo da natureza jurídica | 1º dígito do código: 1 Adm. Pública, 2 Entidade Empresarial, 3 Sem Fins Lucrativos, 4 Pessoa Física, 5 Org. Internacional |
 # MAGIC | Simples / MEI | `left join` por `cnpj_basico`; sem registro no arquivo = não optante |
 # MAGIC | LGPD | **`razao_social` sai.** Em MEI, a razão social é o nome da pessoa seguido do CPF |
+# MAGIC | Duplicatas da fonte | **Exata** (todas as colunas iguais): removida. **Registro vazio** (sem razão social e natureza `0000`/nula) duplicando um CNPJ: descartado (fica o completo; se só houver vazios, fica um). **Dois registros completos e diferentes:** bloqueia (conflito real). Caso real em set/2026: CNPJ `08314885` publicado duas vezes no `empresas2`, uma completa e uma vazia |
 
 # COMMAND ----------
 
@@ -41,8 +46,32 @@ def para_data(coluna):
     return F.when(data >= F.lit("1900-01-01").cast("date"), data)
 
 
+from pyspark.sql.window import Window
+
+# 1) Duplicatas exatas: mesma linha publicada duas vezes
+df_sem_exatas = remover_duplicatas_exatas(df_bronze)
+
+# 2) Registros vazios (sem razão social e natureza 0000/nula) não carregam informação:
+#    - se o CNPJ tem um registro completo, todos os vazios são descartados;
+#    - se o CNPJ só tem vazios, fica um (a empresa existe nos estabelecimentos).
+registro_vazio = (
+    (F.coalesce(F.trim("razao_social"), F.lit("")) == "")
+    & (F.coalesce(F.trim("cod_natureza_juridica"), F.lit("")).isin("", "0", "0000"))
+)
+por_cnpj = Window.partitionBy(F.upper(F.trim("cnpj_basico")))
+ordem_vazios = por_cnpj.orderBy("cod_natureza_juridica", "cod_qualificacao_responsavel", "capital_social", "porte_empresa")
+
+df_fonte = (
+    df_sem_exatas
+    .withColumn("_vazio", registro_vazio)
+    .withColumn("_completos_no_cnpj", F.sum(F.when(~F.col("_vazio"), 1).otherwise(0)).over(por_cnpj))
+    .withColumn("_ordem_vazio", F.row_number().over(ordem_vazios))
+    .filter(~F.col("_vazio") | ((F.col("_completos_no_cnpj") == 0) & (F.col("_ordem_vazio") == 1)))
+    .drop("_vazio", "_completos_no_cnpj", "_ordem_vazio")
+)
+
 # capital_social: remove ponto de milhar (se houver), troca vírgula decimal por ponto, try_cast evita quebra
-df_empresas = df_bronze.select(
+df_empresas = df_fonte.select(
     F.upper(F.trim("cnpj_basico")).alias("cnpj_basico"),
     F.lpad(F.trim("cod_natureza_juridica"), 4, "0").alias("cod_natureza_juridica"),
     F.lpad(F.trim("cod_qualificacao_responsavel"), 2, "0").alias("cod_qualificacao_responsavel"),
@@ -113,6 +142,8 @@ display(df_silver.select(*colunas_finais).limit(10))
 
 with Cronometro("silver_empresas", "checks", DT_REFERENCIA):
     total_bronze = df_bronze.count()
+    total_sem_exatas = df_sem_exatas.count()
+    total_sem_duplicatas = df_fonte.count()
     total_silver = df_silver.count()
 
     executar_checks(
@@ -133,7 +164,11 @@ with Cronometro("silver_empresas", "checks", DT_REFERENCIA):
         ],
         resultados_extras=[
             resultado("tabela não vazia", "bloqueia", 0 if total_silver > 0 else 1, 1),
-            check_contagem(total_bronze, total_silver, "mesma contagem bronze x silver"),
+            resultado("duplicatas exatas na fonte (removidas)", "alerta",
+                      total_bronze - total_sem_exatas, total_bronze, limite_pct=0.01),
+            resultado("registros vazios descartados (duplicata sem informação)", "alerta",
+                      total_sem_exatas - total_sem_duplicatas, total_bronze, limite_pct=0.01),
+            check_contagem(total_sem_duplicatas, total_silver, "contagem silver = bronze sem duplicatas tratadas"),
             check_unicidade(df_silver, ["cnpj_basico"]),
         ],
     )

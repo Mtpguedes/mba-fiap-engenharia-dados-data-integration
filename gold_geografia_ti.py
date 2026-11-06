@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "6"
+# ///
 # MAGIC %md
 # MAGIC # Gold — Mapeamento Geográfico e Distribuição Regional do Setor de TI
 # MAGIC

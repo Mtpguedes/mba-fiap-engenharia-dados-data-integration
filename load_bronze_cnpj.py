@@ -60,7 +60,7 @@ fontes = {
                     "cnae_fiscal_secundaria", "tipo_logradouro", "logradouro", "numero", "complemento",
                     "bairro", "cep", "uf", "cod_municipio", "ddd_1", "telefone_1", "ddd_2", "telefone_2",
                     "ddd_fax", "fax", "correio_eletronico", "situacao_especial", "data_situacao_especial"],
-        "multiline": True,  # há campos com quebra de linha dentro de aspas
+        "multiline": True,
     },
     "socios": {
         "volume": f"{VOLUME_BASE}/cad_receita_socios",
@@ -96,12 +96,12 @@ fontes = {
         "colunas": ["cod_pais", "descricao_pais"],
     },
     "motivos": {
-        "volume": f"{VOLUME_BASE}/cad_receita_motivos",        # CONFIRMAR
+        "volume": f"{VOLUME_BASE}/motivos",
         "padrao": "*.MOTICSV",
         "colunas": ["cod_motivo", "descricao_motivo"],
     },
     "municipios": {
-        "volume": f"{VOLUME_BASE}/cad_receita_municipios",     # CONFIRMAR
+        "volume": f"{VOLUME_BASE}/municipio",
         "padrao": "*.MUNICCSV",
         "colunas": ["cod_municipio", "descricao_municipio"],
     },
@@ -226,3 +226,7 @@ for _, l in volumetria.iterrows():
     print(f"| {l.tabela} | {l.registros:,} | {l.arquivos} | {l.tamanho_gb_csv:.3f} |".replace(",", "."))
 print(f"| **Total** | **{volumetria.registros.sum():,}** | **{volumetria.arquivos.sum()}** | "
       f"**{volumetria.tamanho_gb_csv.sum():.2f}** |".replace(",", "."))
+
+# COMMAND ----------
+
+

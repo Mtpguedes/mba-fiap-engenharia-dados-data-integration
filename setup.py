@@ -88,3 +88,8 @@ else:
     for tabela in tabelas_legadas:
         existe = spark.catalog.tableExists(tabela)
         print(f"  {tabela} — {'existe' if existe else 'não existe'}")
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC GRANT CREATE TABLE, MODIFY ON SCHEMA workspace.bronze TO `mtpguedes@gmail.com`;

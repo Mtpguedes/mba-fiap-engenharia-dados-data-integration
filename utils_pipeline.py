@@ -40,6 +40,16 @@ def ler_bronze(nome, dt_referencia):
     return spark.table(f"workspace.bronze.{nome}").filter(F.col("dt_referencia") == dt_referencia)
 
 
+def remover_duplicatas_exatas(df_bronze):
+    """
+    Remove linhas 100% idênticas em TODAS as colunas da fonte (ignora só as colunas de controle
+    _arquivo_origem e _dt_carga). Não perde informação: é a mesma linha publicada duas vezes.
+    Duplicatas com conteúdo diferente NÃO são removidas aqui — o check de unicidade da silver bloqueia.
+    """
+    colunas_fonte = [c for c in df_bronze.columns if not c.startswith("_")]
+    return df_bronze.dropDuplicates(colunas_fonte)
+
+
 class Cronometro:
     """
     Mede o tempo de uma etapa e grava em workspace.silver.log_execucoes.
